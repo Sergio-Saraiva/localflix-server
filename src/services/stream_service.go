@@ -52,9 +52,9 @@ func (s *StreamService) StartServer() {
 	app.Get("/subtitles/:folderId/:fileName", s.getSubtitles)
 	app.Get("/thumbnails/:folderId/:fileName", s.getThumbnail)
 
-	fmt.Printf("Starting server on port 3000")
+	fmt.Printf("Starting server on port 3001")
 
-	if err := app.Listen("0.0.0.0:3000"); err != nil {
+	if err := app.Listen("0.0.0.0:3001"); err != nil {
 		log.Printf("Error starting server: %v", err)
 	}
 }
@@ -138,18 +138,18 @@ func (s *StreamService) streamVideo(c *fiber.Ctx) error {
 	fileName := c.Params("fileName")
 	fileName, err := url.QueryUnescape(fileName)
 	if err != nil {
-		fmt.Printf("Error unescaping file name: %v", err)
+		log.Default().Printf("Error unescaping file name: %v", err)
 		return c.Status(fiber.StatusBadRequest).SendString("Invalid file name")
 	}
 	folderId := c.Params("folderId")
 	folderIdInt, err := strconv.Atoi(folderId)
 	if err != nil {
-		fmt.Printf("Error converting folder ID to int: %v", err)
+		log.Default().Printf("Error converting folder ID to int: %v", err)
 		return c.Status(fiber.StatusBadRequest).SendString("Invalid folder ID")
 	}
 	folder, err := s.foldersService.GetFolderById(folderIdInt)
 	if err != nil {
-		fmt.Printf("Error getting folder: %v", err)
+		log.Default().Printf("Error getting folder: %v", err)
 		return c.Status(fiber.StatusInternalServerError).SendString("Error retrieving folder")
 	}
 
@@ -157,7 +157,7 @@ func (s *StreamService) streamVideo(c *fiber.Ctx) error {
 
 	file, err := os.Open(filePath)
 	if err != nil {
-		fmt.Printf("Error opening file: %v", err)
+		log.Default().Printf("Error opening file: %v", err)
 		return c.Status(fiber.StatusInternalServerError).SendString("Error opening file")
 	}
 	defer file.Close()
@@ -168,70 +168,56 @@ func (s *StreamService) streamVideo(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).SendString("Error getting file info")
 	}
 	fileSize := fileInfo.Size()
-	// Parse "Range" header
+
 	rangeHeader := c.Get("Range")
-	var start, end int64 = 0, fileSize - 1
-	if rangeHeader != "" {
-		fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
-		if end == 0 || end >= fileSize {
-			end = fileSize - 1 // Default to the last byte of the file
+
+	// If no Range header, serve the whole file
+	if rangeHeader == "" {
+		log.Default().Printf("Serving default chunk size...")
+		const defaultChunkSize int64 = 10 * 1024 * 1024 // 1 MB
+		chunkSize := defaultChunkSize
+		if fileSize < chunkSize {
+			chunkSize = fileSize
 		}
-		if start >= fileSize || start > end {
-			return c.Status(http.StatusRequestedRangeNotSatisfiable).SendString("Invalid range")
-		}
+
+		c.Status(http.StatusPartialContent)
+		c.Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", chunkSize-1, fileSize))
+		c.Set("Content-Length", strconv.FormatInt(chunkSize, 10))
+		c.Set("Content-Type", "video/mp4") // Set the correct MIME type
+
+		log.Default().Printf("Serving file...")
+		_, err = io.CopyN(c.Response().BodyWriter(), file, chunkSize)
+		log.Default().Printf("File served")
+		return err
 	}
 
-	log.Default().Printf("File size: %d", fileSize)
+	// Parse Range header
+	log.Default().Printf("Parsing range header...")
+	var start, end int64
+	_, err = fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
+	if err != nil || end == 0 {
+		log.Default().Printf("Error parsing range header: %v", err)
+		end = fileSize - 1
+	}
+
+	if start < 0 || end >= fileSize || start > end {
+		log.Default().Printf("Invalid range")
+		return c.Status(http.StatusRequestedRangeNotSatisfiable).SendString("Invalid range")
+	}
+
+	log.Default().Printf("Serving range...")
 	log.Default().Printf("Range: %d-%d", start, end)
-	log.Default().Printf("Streaming file %s from %d to %d", fileName, start, end)
-
-	// Set response headers
-	chunkSize := end - start + 1
-	c.Set("Content-Type", "video/mp4")
+	contentLength := end - start + 1
+	c.Status(http.StatusPartialContent)
 	c.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fileSize))
-	c.Set("Content-Length", strconv.FormatInt(chunkSize, 10))
-	c.Status(fiber.StatusPartialContent)
+	c.Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	c.Set("Content-Type", "video/mp4")
 
-	// Seek to the start of the range
-	_, err = file.Seek(start, 0)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).SendString("Failed to seek in file")
-	}
-
-	// Use io.Copy with chunked reading
-	bufferSize := 100 * 1024 * 1024 // 100 MB buffer size
-	buffer := make([]byte, bufferSize)
-
-	// Stream in chunks
-	for {
-		n, err := file.Read(buffer)
-		if err != nil && err != io.EOF {
-			log.Default().Printf("Error reading file: %v", err)
-			return c.Status(fiber.StatusInternalServerError).SendString("Error reading file")
-		}
-
-		if n == 0 {
-			log.Default().Printf("End of file")
-			break // End of file
-		}
-
-		// Write the chunk to the response body
-		_, err = c.Response().BodyWriter().Write(buffer[:n])
-		if err != nil {
-			log.Default().Printf("Error writing chunk: %v", err)
-			return c.Status(fiber.StatusInternalServerError).SendString("Error writing chunk")
-		}
-
-		// If we've streamed all requested bytes, exit the loop
-		if int64(n) >= chunkSize {
-			log.Default().Printf("Streamed all requested bytes")
-			break
-		}
-
-		log.Default().Printf("Streamed %d bytes", n)
-	}
-
-	return nil
+	file.Seek(start, io.SeekStart)
+	log.Default().Printf("Serving file...")
+	_, err = io.CopyN(c.Response().BodyWriter(), file, contentLength)
+	log.Default().Printf("Range served")
+	return err
 }
 
 func (s *StreamService) listFiles(c *fiber.Ctx) error {
@@ -254,36 +240,39 @@ func (s *StreamService) listFiles(c *fiber.Ctx) error {
 
 	var files []models.File
 	for _, entry := range entries {
-		videoFileDuration, err := s.videoFileService.GetVideoDurationInSeconds(fmt.Sprintf("%s/%s", folder.Path, entry.Name()))
-		if err != nil {
-			fmt.Printf("Error getting video duration: %v", err)
-			return err
-		}
+		// videoFileDuration, err := s.videoFileService.GetVideoDurationInSeconds(fmt.Sprintf("%s/%s", folder.Path, entry.Name()))
+		// if err != nil {
+		// 	fmt.Printf("Error getting video duration: %v", err)
+		// 	return err
+		// }
 
 		fileNameWithoutExt := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
-		subtitlePath := fmt.Sprintf("./tmp/subtitles/%d/%s.vtt", folderIdInt, fileNameWithoutExt)
-		if _, err := os.Stat(subtitlePath); os.IsNotExist(err) {
-			s.videoFileService.ExtractAndConvertSubtitles(fmt.Sprintf("%s/%s", folder.Path, entry.Name()), fmt.Sprintf("./tmp/subtitles/%d", folderIdInt), fileNameWithoutExt)
-		}
+		// subtitlePath := fmt.Sprintf("./tmp/subtitles/%d/%s.vtt", folderIdInt, fileNameWithoutExt)
+		// if _, err := os.Stat(subtitlePath); os.IsNotExist(err) {
+		// 	// s.videoFileService.ExtractAndConvertSubtitles(fmt.Sprintf("%s/%s", folder.Path, entry.Name()), fmt.Sprintf("./tmp/subtitles/%d", folderIdInt), fileNameWithoutExt)
+		// }
 
-		thumbnailPath := fmt.Sprintf("./tmp/thumbnails/%d/%s.png", folderIdInt, fileNameWithoutExt)
-		if _, err := os.Stat(thumbnailPath); os.IsNotExist(err) {
-			err = s.videoFileService.GenerateThumbnail(fmt.Sprintf("%s/%s", folder.Path, entry.Name()), thumbnailPath, "00:00:05")
-			if err != nil {
-				fmt.Printf("Error generating thumbnail: %v", err)
-				return c.Status(fiber.StatusInternalServerError).SendString("Error generating thumbnail")
-			}
-		}
+		// thumbnailPath := fmt.Sprintf("./tmp/thumbnails/%d/%s.png", folderIdInt, fileNameWithoutExt)
+		// if _, err := os.Stat(thumbnailPath); os.IsNotExist(err) {
+		// 	// err = s.videoFileService.GenerateThumbnail(fmt.Sprintf("%s/%s", folder.Path, entry.Name()), thumbnailPath, "00:00:05")
+		// 	if err != nil {
+		// 		fmt.Printf("Error generating thumbnail: %v", err)
+		// 		return c.Status(fiber.StatusInternalServerError).SendString("Error generating thumbnail")
+		// 	}
+		// }
+
+		contentLength :=
 
 		file := models.File{
 			Name:         entry.Name(),
-			URL:          fmt.Sprintf("%s/stream/%d/%s", "http://192.168.1.195:3000", folderIdInt, url.PathEscape(entry.Name())),
-			SubtitlesURL: fmt.Sprintf("%s/subtitles/%d/%s", "http://192.168.1.195:3000", folderIdInt, fmt.Sprintf("%s.%s", url.PathEscape(fileNameWithoutExt), "vtt")),
-			ThumbnailURL: fmt.Sprintf("%s/thumbnails/%d/%s", "http://192.168.1.195:3000", folderIdInt, fmt.Sprintf("%s.%s", url.PathEscape(fileNameWithoutExt), "png")),
+			URL:          fmt.Sprintf("%s/stream/%d/%s", "http://192.168.1.195:3001", folderIdInt, url.PathEscape(entry.Name())),
+			SubtitlesURL: fmt.Sprintf("%s/subtitles/%d/%s", "http://192.168.1.195:3001", folderIdInt, fmt.Sprintf("%s.%s", url.PathEscape(fileNameWithoutExt), "vtt")),
+			ThumbnailURL: fmt.Sprintf("%s/thumbnails/%d/%s", "http://192.168.1.195:3001", folderIdInt, fmt.Sprintf("%s.%s", url.PathEscape(fileNameWithoutExt), "png")),
 			FolderID:     folderIdInt,
 			Path:         fmt.Sprintf("%s/%s", folder.Path, entry.Name()),
 			CategoryID:   folder.CategoryID,
-			Duration:     videoFileDuration,
+			Duration:     10000,
+			ContentLength: ,
 		}
 		files = append(files, file)
 	}
